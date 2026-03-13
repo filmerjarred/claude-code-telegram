@@ -322,7 +322,8 @@ async def handle_text_message(
                 return
 
         # Send typing indicator
-        await update.message.chat.send_action("typing")
+        topic_id = update.message.message_thread_id
+        await update.message.chat.send_action("typing", message_thread_id=topic_id)
 
         # Create progress message
         progress_msg = await update.message.reply_text(
@@ -479,6 +480,7 @@ async def handle_text_message(
                                 await update.message.chat.send_media_group(
                                     media=media,
                                     reply_to_message_id=update.message.message_id,
+                                    message_thread_id=topic_id,
                                 )
                                 caption_sent = True
                             finally:
@@ -554,6 +556,7 @@ async def handle_text_message(
                                 await update.message.chat.send_media_group(
                                     media=media,
                                     reply_to_message_id=update.message.message_id,
+                                    message_thread_id=topic_id,
                                 )
                             finally:
                                 for fh in file_handles:
@@ -724,7 +727,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
 
         # Send processing indicator
-        await update.message.chat.send_action("upload_document")
+        topic_id = update.message.message_thread_id
+        await update.message.chat.send_action(
+            "upload_document", message_thread_id=topic_id
+        )
 
         progress_msg = await update.message.reply_text(
             f"📄 Processing file: <code>{document.file_name}</code>...",

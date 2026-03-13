@@ -648,6 +648,7 @@ class MessageOrchestrator:
     def _start_typing_heartbeat(
         chat: Any,
         interval: float = 2.0,
+        message_thread_id: Optional[int] = None,
     ) -> "asyncio.Task[None]":
         """Start a background typing indicator task.
 
@@ -661,7 +662,9 @@ class MessageOrchestrator:
                 while True:
                     await asyncio.sleep(interval)
                     try:
-                        await chat.send_action("typing")
+                        await chat.send_action(
+                            "typing", message_thread_id=message_thread_id
+                        )
                     except Exception:
                         pass
             except asyncio.CancelledError:
@@ -778,6 +781,7 @@ class MessageOrchestrator:
         reply_to_message_id: Optional[int] = None,
         caption: Optional[str] = None,
         caption_parse_mode: Optional[str] = None,
+        message_thread_id: Optional[int] = None,
     ) -> bool:
         """Send extracted images as a media group (album) or documents.
 
@@ -833,6 +837,7 @@ class MessageOrchestrator:
                         await update.message.chat.send_media_group(
                             media=media,
                             reply_to_message_id=reply_to_message_id,
+                            message_thread_id=message_thread_id,
                         )
                         caption_sent = use_caption
                     finally:
@@ -882,7 +887,8 @@ class MessageOrchestrator:
                 return
 
         chat = update.message.chat
-        await chat.send_action("typing")
+        topic_id = update.message.message_thread_id
+        await chat.send_action("typing", message_thread_id=topic_id)
 
         verbose_level = self._get_verbose_level(context)
         progress_msg = await update.message.reply_text("Working...")
@@ -915,7 +921,7 @@ class MessageOrchestrator:
                 bot=context.bot,
                 chat_id=chat.id,
                 draft_id=generate_draft_id(),
-                message_thread_id=update.message.message_thread_id,
+                message_thread_id=topic_id,
                 throttle_interval=self.settings.stream_draft_interval,
             )
 
@@ -930,7 +936,7 @@ class MessageOrchestrator:
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
-        heartbeat = self._start_typing_heartbeat(chat)
+        heartbeat = self._start_typing_heartbeat(chat, message_thread_id=topic_id)
 
         success = True
         try:
@@ -1015,6 +1021,7 @@ class MessageOrchestrator:
                         reply_to_message_id=update.message.message_id,
                         caption=msg.text,
                         caption_parse_mode=msg.parse_mode,
+                        message_thread_id=topic_id,
                     )
                 except Exception as img_err:
                     logger.warning("Image+caption send failed", error=str(img_err))
@@ -1066,6 +1073,7 @@ class MessageOrchestrator:
                         update,
                         images,
                         reply_to_message_id=update.message.message_id,
+                        message_thread_id=topic_id,
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
@@ -1110,7 +1118,8 @@ class MessageOrchestrator:
             return
 
         chat = update.message.chat
-        await chat.send_action("typing")
+        topic_id = update.message.message_thread_id
+        await chat.send_action("typing", message_thread_id=topic_id)
         progress_msg = await update.message.reply_text("Working...")
 
         # Try enhanced file handler, fall back to basic
@@ -1176,7 +1185,7 @@ class MessageOrchestrator:
             approved_directory=self.settings.approved_directory,
         )
 
-        heartbeat = self._start_typing_heartbeat(chat)
+        heartbeat = self._start_typing_heartbeat(chat, message_thread_id=topic_id)
         try:
             claude_response = await claude_integration.run_command(
                 prompt=prompt,
@@ -1224,6 +1233,7 @@ class MessageOrchestrator:
                             reply_to_message_id=update.message.message_id,
                             caption=msg.text,
                             caption_parse_mode=msg.parse_mode,
+                            message_thread_id=topic_id,
                         )
                     except Exception as img_err:
                         logger.warning("Image+caption send failed", error=str(img_err))
@@ -1247,6 +1257,7 @@ class MessageOrchestrator:
                             update,
                             images,
                             reply_to_message_id=update.message.message_id,
+                            message_thread_id=topic_id,
                         )
                     except Exception as img_err:
                         logger.warning("Image send failed", error=str(img_err))
@@ -1273,7 +1284,8 @@ class MessageOrchestrator:
             return
 
         chat = update.message.chat
-        await chat.send_action("typing")
+        topic_id = update.message.message_thread_id
+        await chat.send_action("typing", message_thread_id=topic_id)
         progress_msg = await update.message.reply_text("Working...")
 
         try:
@@ -1288,6 +1300,7 @@ class MessageOrchestrator:
                 progress_msg=progress_msg,
                 user_id=user_id,
                 chat=chat,
+                message_thread_id=topic_id,
             )
 
         except Exception as e:
@@ -1312,7 +1325,8 @@ class MessageOrchestrator:
             return
 
         chat = update.message.chat
-        await chat.send_action("typing")
+        topic_id = update.message.message_thread_id
+        await chat.send_action("typing", message_thread_id=topic_id)
         progress_msg = await update.message.reply_text("Transcribing...")
 
         try:
@@ -1329,6 +1343,7 @@ class MessageOrchestrator:
                 progress_msg=progress_msg,
                 user_id=user_id,
                 chat=chat,
+                message_thread_id=topic_id,
             )
 
         except Exception as e:
@@ -1348,6 +1363,7 @@ class MessageOrchestrator:
         progress_msg: Any,
         user_id: int,
         chat: Any,
+        message_thread_id: Optional[int] = None,
     ) -> None:
         """Run a media-derived prompt through Claude and send responses."""
         claude_integration = context.bot_data.get("claude_integration")
@@ -1375,7 +1391,9 @@ class MessageOrchestrator:
             approved_directory=self.settings.approved_directory,
         )
 
-        heartbeat = self._start_typing_heartbeat(chat)
+        heartbeat = self._start_typing_heartbeat(
+            chat, message_thread_id=message_thread_id
+        )
         try:
             claude_response = await claude_integration.run_command(
                 prompt=prompt,
@@ -1423,6 +1441,7 @@ class MessageOrchestrator:
                         reply_to_message_id=update.message.message_id,
                         caption=msg.text,
                         caption_parse_mode=msg.parse_mode,
+                        message_thread_id=message_thread_id,
                     )
                 except Exception as img_err:
                     logger.warning("Image+caption send failed", error=str(img_err))
@@ -1446,6 +1465,7 @@ class MessageOrchestrator:
                         update,
                         images,
                         reply_to_message_id=update.message.message_id,
+                        message_thread_id=message_thread_id,
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
