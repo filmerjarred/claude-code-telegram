@@ -905,6 +905,7 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
 
     # Format status message
+    gardenfs_version = os.environ.get("GARDENFS_VERSION", "")
     status_lines = [
         "📊 <b>Session Status</b>",
         "",
@@ -913,6 +914,8 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         usage_info.rstrip(),
         f"🕐 Last Update: {update.message.date.strftime('%H:%M:%S UTC')}",
     ]
+    if gardenfs_version:
+        status_lines.append(f"📦 GardenFS: <code>{gardenfs_version}</code>")
 
     if claude_session_id:
         status_lines.append(f"🆔 Session ID: <code>{claude_session_id[:8]}...</code>")
