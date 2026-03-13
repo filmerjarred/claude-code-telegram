@@ -10,7 +10,7 @@ Features:
 
 import json
 from pathlib import Path
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -283,6 +283,16 @@ class Settings(BaseSettings):
         ge=0.0,
     )
 
+    # GardenFS integration
+    bot_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Bot config from GardenFS server (JSON from BOT_CONFIG env var)",
+    )
+    garden_server_url: Optional[str] = Field(
+        default=None,
+        description="GardenFS server URL for config persistence callbacks",
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
@@ -387,6 +397,24 @@ class Settings(BaseSettings):
         if mode not in {"private", "group"}:
             raise ValueError("project_threads_mode must be one of ['private', 'group']")
         return mode
+
+    @field_validator("bot_config", mode="before")
+    @classmethod
+    def parse_bot_config(cls, v: Any) -> Optional[Dict[str, Any]]:
+        """Parse BOT_CONFIG from JSON string env var."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return None
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                return None
+        if isinstance(v, dict):
+            return v
+        return None
 
     @field_validator("voice_provider", mode="before")
     @classmethod

@@ -143,6 +143,15 @@ class MessageOrchestrator:
                 if not allowed:
                     return
 
+            # Forum topic filtering (independent of project thread mode)
+            is_listen_bypass = handler.__name__ in {
+                "agentic_listen",
+                "agentic_ignore",
+                "agentic_topics",
+            }
+            if not is_listen_bypass and not self._should_handle_in_forum(update):
+                return  # Silently ignore messages in non-configured topics
+
             try:
                 await handler(update, context)
             finally:
@@ -274,6 +283,41 @@ class MessageOrchestrator:
             return 1
         return None
 
+    def _should_handle_in_forum(self, update: Update) -> bool:
+        """Check if the bot should handle this message based on topic config.
+
+        Private chats: always handle.
+        Non-forum groups: always handle.
+        Forum groups: only handle if the topic is in the listen list.
+        """
+        chat = update.effective_chat
+        if not chat:
+            return False
+
+        # Private chats — always listen
+        if getattr(chat, "type", "") == "private":
+            return True
+
+        # Non-forum groups — always listen
+        if not getattr(chat, "is_forum", False):
+            return True
+
+        # Forum group — check listen_topics config
+        # Structure: {chat_id: {str(topic_id): name, ...}}
+        bot_config = self.settings.bot_config or {}
+        listen_topics = bot_config.get("listen_topics", {})
+        chat_topics = listen_topics.get(str(chat.id), {})
+
+        # No topics configured for this chat — ignore all
+        if not chat_topics:
+            return False
+
+        message_thread_id = self._extract_message_thread_id(update)
+        if message_thread_id is None:
+            return False
+
+        return str(message_thread_id) in chat_topics
+
     async def _reject_for_thread_mode(self, update: Update, message: str) -> None:
         """Send a guidance response when strict thread routing rejects an update."""
         query = update.callback_query
@@ -308,6 +352,9 @@ class MessageOrchestrator:
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
+            ("listen", self.agentic_listen),
+            ("ignore", self.agentic_ignore),
+            ("topics", self.agentic_topics),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -417,6 +464,9 @@ class MessageOrchestrator:
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
+                BotCommand("listen", "Listen on this forum topic"),
+                BotCommand("ignore", "Stop listening on this topic"),
+                BotCommand("topics", "List listened forum topics"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -1574,6 +1624,181 @@ class MessageOrchestrator:
             parse_mode="HTML",
             reply_markup=reply_markup,
         )
+
+    def _default_topic_name(self, topic_id: int) -> str:
+        """Return a default display name for a topic ID."""
+        return "General" if topic_id == 1 else f"Topic {topic_id}"
+
+    async def agentic_listen(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Add the current forum topic to the bot's listen list.
+
+        /listen              — add this topic (auto-named)
+        /listen My Topic     — add this topic with a custom name
+        """
+        chat = update.effective_chat
+        if not chat or not getattr(chat, "is_forum", False):
+            await update.message.reply_text(
+                "This command only works in forum (topic) groups."
+            )
+            return
+
+        topic_id = self._extract_message_thread_id(update)
+        if topic_id is None:
+            await update.message.reply_text("Could not determine topic ID.")
+            return
+
+        # Try to extract topic name from reply_to_message's forum_topic_created
+        msg = update.effective_message
+        auto_name: Optional[str] = None
+        if msg and msg.reply_to_message:
+            ftc = getattr(msg.reply_to_message, "forum_topic_created", None)
+            if ftc:
+                auto_name = getattr(ftc, "name", None)
+
+        args = update.message.text.split(maxsplit=1)[1:] if update.message.text else []
+        name = args[0].strip() if args else (auto_name or self._default_topic_name(topic_id))
+
+        chat_id = str(chat.id)
+        topic_key = str(topic_id)
+        bot_config = dict(self.settings.bot_config or {})
+        listen_topics: Dict[str, Dict[str, str]] = bot_config.get(
+            "listen_topics", {}
+        )
+        chat_topics = dict(listen_topics.get(chat_id, {}))
+
+        if topic_key in chat_topics:
+            await update.message.reply_text(
+                f"Already listening on <b>{escape_html(chat_topics[topic_key])}</b>.",
+                parse_mode="HTML",
+            )
+            return
+
+        chat_topics[topic_key] = name
+        listen_topics[chat_id] = chat_topics
+        bot_config["listen_topics"] = listen_topics
+        self.settings.bot_config = bot_config
+
+        await self._persist_bot_config(bot_config)
+        await update.message.reply_text(
+            f"Now listening on <b>{escape_html(name)}</b>.",
+            parse_mode="HTML",
+        )
+
+    async def agentic_ignore(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Remove the current forum topic from the bot's listen list.
+
+        /ignore              — remove this topic
+        /ignore Topic Name   — remove by name
+        """
+        chat = update.effective_chat
+        if not chat or not getattr(chat, "is_forum", False):
+            await update.message.reply_text(
+                "This command only works in forum (topic) groups."
+            )
+            return
+
+        chat_id = str(chat.id)
+        bot_config = dict(self.settings.bot_config or {})
+        listen_topics: Dict[str, Dict[str, str]] = bot_config.get(
+            "listen_topics", {}
+        )
+        chat_topics = dict(listen_topics.get(chat_id, {}))
+
+        args = update.message.text.split(maxsplit=1)[1:] if update.message.text else []
+        if args:
+            # Match by name (case-insensitive)
+            target = args[0].strip().lower()
+            topic_key = None
+            topic_name = None
+            for k, v in chat_topics.items():
+                if v.lower() == target:
+                    topic_key = k
+                    topic_name = v
+                    break
+            if not topic_key:
+                await update.message.reply_text(
+                    f"No topic named <b>{escape_html(args[0].strip())}</b> in listen list.",
+                    parse_mode="HTML",
+                )
+                return
+        else:
+            topic_id = self._extract_message_thread_id(update)
+            if topic_id is None:
+                await update.message.reply_text("Could not determine topic ID.")
+                return
+            topic_key = str(topic_id)
+            topic_name = chat_topics.get(topic_key)
+
+        if topic_key not in chat_topics:
+            await update.message.reply_text(
+                f"Not listening on this topic.",
+            )
+            return
+
+        display = escape_html(topic_name or self._default_topic_name(int(topic_key)))
+        del chat_topics[topic_key]
+        if chat_topics:
+            listen_topics[chat_id] = chat_topics
+        else:
+            listen_topics.pop(chat_id, None)
+        bot_config["listen_topics"] = listen_topics
+        self.settings.bot_config = bot_config
+
+        await self._persist_bot_config(bot_config)
+        await update.message.reply_text(
+            f"Stopped listening on <b>{display}</b>.",
+            parse_mode="HTML",
+        )
+
+    async def agentic_topics(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """List forum topics the bot is listening on in this chat."""
+        chat = update.effective_chat
+        if not chat or not getattr(chat, "is_forum", False):
+            await update.message.reply_text(
+                "This command only works in forum (topic) groups."
+            )
+            return
+
+        bot_config = self.settings.bot_config or {}
+        listen_topics = bot_config.get("listen_topics", {})
+        chat_topics: Dict[str, str] = listen_topics.get(str(chat.id), {})
+
+        if not chat_topics:
+            await update.message.reply_text(
+                "Not listening on any topics. Use /listen to add one."
+            )
+            return
+
+        lines = [f"  {escape_html(name)} <code>(#{tid})</code>"
+                 for tid, name in chat_topics.items()]
+        await update.message.reply_text(
+            "<b>Listening on:</b>\n" + "\n".join(lines),
+            parse_mode="HTML",
+        )
+
+    async def _persist_bot_config(self, bot_config: Dict[str, Any]) -> None:
+        """Save bot_config back to the GardenFS server for Supabase persistence."""
+        url = self.settings.garden_server_url
+        if not url:
+            logger.warning("No GARDEN_SERVER_URL configured — config not persisted")
+            return
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{url}/claude-bot/config", json=bot_config
+                )
+                resp.raise_for_status()
+            logger.info("Bot config persisted to garden server")
+        except Exception as exc:
+            logger.error("Failed to persist bot config", error=str(exc))
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
