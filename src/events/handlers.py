@@ -62,6 +62,14 @@ class AgentHandler:
                 user_id=self.default_user_id,
             )
 
+            logger.info(
+                "Webhook agent response",
+                provider=event.provider,
+                event_type=event.event_type_name,
+                has_content=bool(response.content),
+                content_preview=response.content[:500] if response.content else None,
+            )
+
             if response.content:
                 # We don't know which chat to send to from a webhook alone.
                 # The notification service needs configured target chats.
@@ -135,6 +143,10 @@ class AgentHandler:
 
     def _build_webhook_prompt(self, event: WebhookEvent) -> str:
         """Build a Claude prompt from a webhook event."""
+        # GardenFS $oncreate triggers carry their own instructions
+        if event.provider == "gardenfs" and event.event_type_name == "oncreate":
+            return self._build_oncreate_prompt(event.payload)
+
         payload_summary = self._summarize_payload(event.payload)
 
         return (
@@ -143,6 +155,25 @@ class AgentHandler:
             f"Payload summary:\n{payload_summary}\n\n"
             f"Analyze this event and provide a concise summary. "
             f"Highlight anything that needs my attention."
+        )
+
+    def _build_oncreate_prompt(self, payload: Dict[str, Any]) -> str:
+        """Build a prompt from a $oncreate.md trigger."""
+        files = payload.get("files", [])
+        instructions = payload.get("instructions", "")
+        directory = payload.get("dir", "")
+
+        files_list = "\n".join(f"- {f}" for f in files)
+
+        return (
+            f"New files have appeared in the garden directory `{directory}/`:\n"
+            f"{files_list}\n\n"
+            f"Instructions from `{directory}/$oncreate.md`:\n\n"
+            f"{instructions}\n\n"
+            f"IMPORTANT: After processing each file, add this marker as the very "
+            f"first line of the file so it is not processed again:\n"
+            f"gardenfs-processed: <current ISO timestamp>\n\n"
+            f"Process each file now."
         )
 
     def _summarize_payload(self, payload: Dict[str, Any], max_depth: int = 2) -> str:

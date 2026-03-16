@@ -289,6 +289,15 @@ async def run_application(app: Dict[str, Any]) -> None:
         notification_service.register()
         await notification_service.start()
 
+        # Restore persisted notification channels from bot_config
+        bot_config = config.bot_config or {}
+        for ch in bot_config.get("notification_channels", []):
+            notification_service.set_notification_channel(
+                ch["chat_id"], ch.get("thread_id")
+            )
+
+        bot.deps["notification_service"] = notification_service
+
         # Collect concurrent tasks
         tasks = []
 

@@ -5,7 +5,7 @@ through the Telegram bot API with rate limiting (1 msg/sec per chat).
 """
 
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import structlog
 from telegram import Bot
@@ -20,6 +20,9 @@ logger = structlog.get_logger()
 # Telegram rate limit: ~30 msgs/sec globally, ~1 msg/sec per chat
 SEND_INTERVAL_SECONDS = 1.1
 
+# A notification target: (chat_id, optional message_thread_id)
+NotificationTarget = Tuple[int, Optional[int]]
+
 
 class NotificationService:
     """Delivers agent responses to Telegram chats with rate limiting."""
@@ -32,7 +35,10 @@ class NotificationService:
     ) -> None:
         self.event_bus = event_bus
         self.bot = bot
-        self.default_chat_ids = default_chat_ids or []
+        # Convert bare chat IDs to (chat_id, None) targets
+        self._targets: List[NotificationTarget] = [
+            (cid, None) for cid in (default_chat_ids or [])
+        ]
         self._send_queue: asyncio.Queue[AgentResponseEvent] = asyncio.Queue()
         self._last_send_per_chat: dict[int, float] = {}
         self._running = False
@@ -67,7 +73,47 @@ class NotificationService:
         """Queue an agent response for delivery."""
         if not isinstance(event, AgentResponseEvent):
             return
+        targets = self._resolve_targets(event)
+        if not targets:
+            logger.warning(
+                "Agent response has no notification targets — message will be dropped. "
+                "Use /set_notification_channel in a Telegram chat to configure delivery.",
+                event_id=event.id,
+                text_preview=event.text[:200] if event.text else None,
+            )
+            return
         await self._send_queue.put(event)
+
+    def set_notification_channel(
+        self, chat_id: int, thread_id: Optional[int] = None
+    ) -> None:
+        """Set a chat (+ optional thread) as a notification target."""
+        target: NotificationTarget = (chat_id, thread_id)
+        if target not in self._targets:
+            self._targets.append(target)
+            logger.info(
+                "Notification channel added",
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+
+    def clear_notification_channel(
+        self, chat_id: int, thread_id: Optional[int] = None
+    ) -> None:
+        """Remove a notification target."""
+        target: NotificationTarget = (chat_id, thread_id)
+        if target in self._targets:
+            self._targets.remove(target)
+            logger.info(
+                "Notification channel removed",
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+
+    @property
+    def targets(self) -> List[NotificationTarget]:
+        """Current notification targets."""
+        return list(self._targets)
 
     async def _process_send_queue(self) -> None:
         """Process queued messages with rate limiting."""
@@ -79,18 +125,21 @@ class NotificationService:
             except asyncio.CancelledError:
                 break
 
-            chat_ids = self._resolve_chat_ids(event)
-            for chat_id in chat_ids:
-                await self._rate_limited_send(chat_id, event)
+            targets = self._resolve_targets(event)
+            for target in targets:
+                await self._rate_limited_send(target, event)
 
-    def _resolve_chat_ids(self, event: AgentResponseEvent) -> List[int]:
+    def _resolve_targets(self, event: AgentResponseEvent) -> List[NotificationTarget]:
         """Determine which chats to send to."""
         if event.chat_id and event.chat_id != 0:
-            return [event.chat_id]
-        return list(self.default_chat_ids)
+            return [(event.chat_id, None)]
+        return list(self._targets)
 
-    async def _rate_limited_send(self, chat_id: int, event: AgentResponseEvent) -> None:
+    async def _rate_limited_send(
+        self, target: NotificationTarget, event: AgentResponseEvent
+    ) -> None:
         """Send message with per-chat rate limiting."""
+        chat_id, thread_id = target
         loop = asyncio.get_event_loop()
         now = loop.time()
         last_send = self._last_send_per_chat.get(chat_id, 0.0)
@@ -104,12 +153,17 @@ class NotificationService:
             text = event.text
             chunks = self._split_message(text)
 
+            send_kwargs: dict = {
+                "chat_id": chat_id,
+                "parse_mode": (
+                    ParseMode.HTML if event.parse_mode == "HTML" else None
+                ),
+            }
+            if thread_id is not None:
+                send_kwargs["message_thread_id"] = thread_id
+
             for chunk in chunks:
-                await self.bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk,
-                    parse_mode=(ParseMode.HTML if event.parse_mode == "HTML" else None),
-                )
+                await self.bot.send_message(text=chunk, **send_kwargs)
                 self._last_send_per_chat[chat_id] = asyncio.get_event_loop().time()
 
                 # Rate limit between chunks too
@@ -119,6 +173,7 @@ class NotificationService:
             logger.info(
                 "Notification sent",
                 chat_id=chat_id,
+                thread_id=thread_id,
                 text_length=len(text),
                 chunks=len(chunks),
                 originating_event=event.originating_event_id,
@@ -127,6 +182,7 @@ class NotificationService:
             logger.error(
                 "Failed to send notification",
                 chat_id=chat_id,
+                thread_id=thread_id,
                 error=str(e),
                 event_id=event.id,
             )

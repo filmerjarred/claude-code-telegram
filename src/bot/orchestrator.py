@@ -148,6 +148,8 @@ class MessageOrchestrator:
                 "agentic_listen",
                 "agentic_ignore",
                 "agentic_topics",
+                "set_notification_channel",
+                "clear_notification_channel",
             }
             if not is_listen_bypass and not self._should_handle_in_forum(update):
                 return  # Silently ignore messages in non-configured topics
@@ -355,6 +357,8 @@ class MessageOrchestrator:
             ("listen", self.agentic_listen),
             ("ignore", self.agentic_ignore),
             ("topics", self.agentic_topics),
+            ("set_notification_channel", self.set_notification_channel),
+            ("clear_notification_channel", self.clear_notification_channel),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -467,6 +471,8 @@ class MessageOrchestrator:
                 BotCommand("listen", "Listen on this forum topic"),
                 BotCommand("ignore", "Stop listening on this topic"),
                 BotCommand("topics", "List listened forum topics"),
+                BotCommand("set_notification_channel", "Send notifications here"),
+                BotCommand("clear_notification_channel", "Stop notifications here"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -561,7 +567,7 @@ class MessageOrchestrator:
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Compact one-line status, no buttons."""
+        """Show bot status including session, topics, notifications, and allowed users."""
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
@@ -578,12 +584,53 @@ class MessageOrchestrator:
                 user_status = rate_limiter.get_user_status(update.effective_user.id)
                 cost_usage = user_status.get("cost_usage", {})
                 current_cost = cost_usage.get("current", 0.0)
-                cost_str = f" · Cost: ${current_cost:.2f}"
+                cost_str = f"Cost: ${current_cost:.2f}\n"
             except Exception:
                 pass
 
+        # Notification channels
+        notification_service = context.bot_data.get("notification_service")
+        if notification_service and notification_service.targets:
+            targets = []
+            for chat_id, thread_id in notification_service.targets:
+                if thread_id:
+                    targets.append(f"  {chat_id} (thread {thread_id})")
+                else:
+                    targets.append(f"  {chat_id}")
+            notif_str = "Notifications:\n" + "\n".join(targets) + "\n"
+        else:
+            notif_str = "Notifications: none\n"
+
+        # Listened topics
+        bot_config = self.settings.bot_config or {}
+        listen_topics = bot_config.get("listen_topics", {})
+        if listen_topics:
+            topic_lines = []
+            for chat_id, topics in listen_topics.items():
+                for topic_id, name in topics.items():
+                    topic_lines.append(f"  {name} ({chat_id}:{topic_id})")
+            topics_str = "Topics:\n" + "\n".join(topic_lines) + "\n"
+        else:
+            topics_str = "Topics: none\n"
+
+        # Auth mode
+        auth_mode = "API key" if self.settings.anthropic_api_key else "CLI login"
+
+        # Allowed users
+        allowed = self.settings.allowed_users
+        if allowed:
+            users_str = "Allowed users: " + ", ".join(str(u) for u in allowed) + "\n"
+        else:
+            users_str = "Allowed users: all (dev mode)\n"
+
         await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
+            f"📂 {dir_display}\n"
+            f"Session: {session_status}\n"
+            f"Auth: {auth_mode}\n"
+            f"{cost_str}"
+            f"{notif_str}"
+            f"{topics_str}"
+            f"{users_str}"
         )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1791,14 +1838,105 @@ class MessageOrchestrator:
         try:
             import httpx
 
+            target = f"{url}/claude-bot/config"
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"{url}/claude-bot/config", json=bot_config
-                )
+                resp = await client.post(target, json=bot_config)
                 resp.raise_for_status()
-            logger.info("Bot config persisted to garden server")
+            logger.info("Bot config persisted to garden server", url=target)
         except Exception as exc:
-            logger.error("Failed to persist bot config", error=str(exc))
+            logger.error(
+                "Failed to persist bot config to garden server",
+                url=f"{url}/claude-bot/config",
+                error=str(exc),
+                hint="Is GARDEN_SERVER_URL correct? Server may be on a different port.",
+            )
+
+    async def set_notification_channel(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Set the current chat/topic as the notification channel for webhooks.
+
+        /set_notification_channel — notifications will be sent here
+        """
+        chat = update.effective_chat
+        if not chat:
+            return
+
+        notification_service = context.bot_data.get("notification_service")
+        if not notification_service:
+            await update.message.reply_text("Notification service is not available.")
+            return
+
+        chat_id = chat.id
+        thread_id = self._extract_message_thread_id(update)
+        # In non-forum chats, don't pass a thread_id
+        if not getattr(chat, "is_forum", False):
+            thread_id = None
+
+        notification_service.set_notification_channel(chat_id, thread_id)
+
+        # Persist to bot_config so it survives restarts
+        bot_config = dict(self.settings.bot_config or {})
+        channels: List[Dict[str, Any]] = bot_config.get(
+            "notification_channels", []
+        )
+        entry: Dict[str, Any] = {"chat_id": chat_id, "thread_id": thread_id}
+        if entry not in channels:
+            channels.append(entry)
+        bot_config["notification_channels"] = channels
+        self.settings.bot_config = bot_config
+        await self._persist_bot_config(bot_config)
+
+        location = escape_html(chat.title or "this chat")
+        if thread_id is not None:
+            location += f" (topic #{thread_id})"
+        await update.message.reply_text(
+            f"Notifications will be sent to <b>{location}</b>.",
+            parse_mode="HTML",
+        )
+
+    async def clear_notification_channel(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Remove the current chat/topic from notification targets.
+
+        /clear_notification_channel — stop sending notifications here
+        """
+        chat = update.effective_chat
+        if not chat:
+            return
+
+        notification_service = context.bot_data.get("notification_service")
+        if not notification_service:
+            await update.message.reply_text("Notification service is not available.")
+            return
+
+        chat_id = chat.id
+        thread_id = self._extract_message_thread_id(update)
+        if not getattr(chat, "is_forum", False):
+            thread_id = None
+
+        notification_service.clear_notification_channel(chat_id, thread_id)
+
+        # Remove from persisted config
+        bot_config = dict(self.settings.bot_config or {})
+        channels: List[Dict[str, Any]] = bot_config.get(
+            "notification_channels", []
+        )
+        entry: Dict[str, Any] = {"chat_id": chat_id, "thread_id": thread_id}
+        if entry in channels:
+            channels.remove(entry)
+        bot_config["notification_channels"] = channels
+        self.settings.bot_config = bot_config
+        await self._persist_bot_config(bot_config)
+
+        location = escape_html(chat.title or "this chat")
+        if thread_id is not None:
+            location += f" (topic #{thread_id})"
+        await update.message.reply_text(
+            f"Stopped sending notifications to <b>{location}</b>.",
+            parse_mode="HTML",
+        )
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
