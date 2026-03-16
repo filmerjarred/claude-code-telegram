@@ -103,11 +103,21 @@ class ClaudeCodeBot:
     def _add_middleware(self) -> None:
         """Add middleware to application."""
         from .middleware.auth import auth_middleware
+        from .middleware.forum_filter import forum_filter_middleware
         from .middleware.rate_limit import rate_limit_middleware
         from .middleware.security import security_middleware
 
         # Middleware runs in order of group numbers (lower = earlier)
-        # Security middleware first (validate inputs)
+        # Forum topic filter first — drop non-listened topics before
+        # auth can create sessions or send welcome messages
+        self.app.add_handler(
+            MessageHandler(
+                filters.ALL, self._create_middleware_handler(forum_filter_middleware)
+            ),
+            group=-4,
+        )
+
+        # Security middleware second (validate inputs)
         self.app.add_handler(
             MessageHandler(
                 filters.ALL, self._create_middleware_handler(security_middleware)

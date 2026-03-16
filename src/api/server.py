@@ -184,7 +184,7 @@ async def run_api_server(
 
     config = uvicorn.Config(
         app=app,
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=settings.api_server_port,
         log_level="info" if not settings.debug else "debug",
     )

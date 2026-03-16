@@ -613,8 +613,26 @@ class MessageOrchestrator:
         else:
             topics_str = "Topics: none\n"
 
-        # Auth mode
+        # Auth mode — check CLI status for details
         auth_mode = "API key" if self.settings.anthropic_api_key else "CLI login"
+        cli_detail = ""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["claude", "auth", "status"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                import json as _json
+                cli_status = _json.loads(result.stdout)
+                if cli_status.get("loggedIn"):
+                    email = cli_status.get("email", "")
+                    sub = cli_status.get("subscriptionType", "")
+                    cli_detail = f" ({email}, {sub})" if email else ""
+                else:
+                    cli_detail = " (not logged in)"
+        except Exception:
+            pass
 
         # Allowed users
         allowed = self.settings.allowed_users
@@ -626,7 +644,7 @@ class MessageOrchestrator:
         await update.message.reply_text(
             f"📂 {dir_display}\n"
             f"Session: {session_status}\n"
-            f"Auth: {auth_mode}\n"
+            f"Auth: {auth_mode}{cli_detail}\n"
             f"{cost_str}"
             f"{notif_str}"
             f"{topics_str}"
