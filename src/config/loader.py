@@ -68,6 +68,7 @@ def load_config(
             debug=settings.debug,
             approved_directory=str(settings.approved_directory),
             features_enabled=_get_enabled_features_summary(settings),
+            skills_plugin_dir=str(settings.skills_plugin_dir) if settings.skills_plugin_dir else None,
         )
 
         return settings

@@ -164,6 +164,10 @@ class Settings(BaseSettings):
     mcp_config_path: Optional[Path] = Field(
         None, description="MCP configuration file path"
     )
+    skills_plugin_dir: Optional[Path] = Field(
+        None,
+        description="Directory containing Claude Code skill plugins (--plugin-dir)",
+    )
     enable_git_integration: bool = Field(True, description="Enable git commands")
     enable_file_uploads: bool = Field(True, description="Enable file upload handling")
     enable_voice_messages: bool = Field(
@@ -195,6 +199,30 @@ class Settings(BaseSettings):
         ge=1,
         le=200,
     )
+
+    # Text-to-speech (TTS)
+    enable_tts: bool = Field(
+        True,
+        description="Enable text-to-speech voice message generation via HTTP endpoint",
+    )
+    tts_model: str = Field(
+        "gpt-4o-mini-tts",
+        description="OpenAI TTS model (e.g. 'tts-1', 'gpt-4o-mini-tts')",
+    )
+    tts_voice: str = Field(
+        "nova",
+        description=(
+            "Default TTS voice "
+            "(alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer)"
+        ),
+    )
+    tts_max_chars: int = Field(
+        4096,
+        description="Maximum text length for TTS generation",
+        ge=1,
+        le=10000,
+    )
+
     enable_quick_actions: bool = Field(True, description="Enable quick action buttons")
     agentic_mode: bool = Field(
         True,
@@ -293,6 +321,23 @@ class Settings(BaseSettings):
         description="GardenFS server URL for config persistence callbacks",
     )
 
+    # Web interface (Supabase auth)
+    enable_web_interface: bool = Field(
+        False, description="Enable web chat interface with Supabase auth"
+    )
+    supabase_url: Optional[str] = Field(
+        default="https://fmkytgctlrjdvpiusuhv.supabase.co",
+        description="Supabase project URL for web auth",
+    )
+    supabase_anon_key: Optional[str] = Field(
+        default=None,
+        description="Supabase anon/public key for web auth",
+    )
+    api_server_host: str = Field(
+        "127.0.0.1",
+        description="API server bind address (set to 0.0.0.0 for external access)",
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
@@ -368,6 +413,24 @@ class Settings(BaseSettings):
             raise ValueError(
                 "'mcpServers' must contain at least one server configuration"
             )
+        return v  # type: ignore[no-any-return]
+
+    @field_validator("skills_plugin_dir", mode="before")
+    @classmethod
+    def validate_skills_plugin_dir(cls, v: Any) -> Optional[Path]:
+        """Validate skills plugin directory if provided."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            value = v.strip()
+            if not value:
+                return None
+            v = Path(value)
+        v = v.resolve()
+        if not v.exists():
+            raise ValueError(f"Skills plugin directory does not exist: {v}")
+        if not v.is_dir():
+            raise ValueError(f"Skills plugin path is not a directory: {v}")
         return v  # type: ignore[no-any-return]
 
     @field_validator("projects_config_path", mode="before")

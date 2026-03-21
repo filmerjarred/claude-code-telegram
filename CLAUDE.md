@@ -135,3 +135,55 @@ Agentic mode commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`. If `ENA
 2. Register in `MessageOrchestrator._register_classic_handlers()`
 3. Add to `MessageOrchestrator.get_bot_commands()` for Telegram's command menu
 4. Add audit logging for the command
+
+## Adding Skills
+
+Skills give the bot's Claude instance reusable capabilities (like slash commands) that Claude can invoke automatically based on context. They are standard Claude Code skills loaded via `--plugin-dir`.
+
+### Setup
+
+Set `SKILLS_PLUGIN_DIR` in `.env` to a directory containing a `skills/` subdirectory:
+
+```bash
+SKILLS_PLUGIN_DIR=/path/to/plugin
+```
+
+The default plugin directory in this repo is `plugin/`. Structure:
+
+```
+plugin/                  <-- SKILLS_PLUGIN_DIR points here
+  skills/
+    my-skill/
+      SKILL.md           <-- skill definition
+    another-skill/
+      SKILL.md
+```
+
+### Creating a skill
+
+Create a directory under `plugin/skills/` with a `SKILL.md` file:
+
+```yaml
+---
+name: my-skill
+description: When to trigger this skill (Claude uses this to decide)
+---
+
+Instructions for Claude when this skill is invoked.
+```
+
+Key frontmatter fields:
+- `name`: Skill name (used as `plugin:<name>` when invoked)
+- `description`: Tells Claude when to auto-invoke the skill -- be specific
+- `disable-model-invocation: true`: Only allow explicit `/my-skill` invocation, prevent auto-trigger
+- `allowed-tools`: Tools Claude can use within the skill (e.g., `Read, Bash`)
+
+Use `$ARGUMENTS` in the body to reference user-provided arguments.
+
+### How it works
+
+`ClaudeSDKManager` passes `SKILLS_PLUGIN_DIR` as `options.plugins` to `ClaudeAgentOptions`, which translates to `--plugin-dir` on the CLI. Claude discovers skills in the `skills/` subdirectory and loads their descriptions into context. Skills appear as `plugin:<name>` and are invoked via the `Skill` tool (already in the default `claude_allowed_tools` list).
+
+### Example
+
+See `plugin/skills/date/SKILL.md` for a working example.

@@ -297,10 +297,16 @@ class TestClaudeSDKManager:
                 working_directory=tmp_path,
             )
 
-        # Verify MCP config was parsed and passed as dict to options
+        # Verify MCP config was parsed and passed as dict to options.
+        # _load_mcp_config injects a ``cwd`` for servers that don't specify
+        # one (resolved to project root, or config dir as fallback).
         assert len(captured_options) == 1
         assert captured_options[0].mcp_servers == {
-            "test-server": {"command": "echo", "args": ["hello"]}
+            "test-server": {
+                "command": "echo",
+                "args": ["hello"],
+                "cwd": str(tmp_path),
+            }
         }
 
     async def test_execute_command_no_mcp_when_disabled(self, sdk_manager):

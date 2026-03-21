@@ -38,6 +38,12 @@ from .utils.image_extractor import (
     should_send_as_photo,
     validate_image_path,
 )
+from .utils.voice_synthesizer import (
+    MAX_VOICE_MESSAGES_PER_RESPONSE,
+    VoiceAttachment,
+    synthesize_voice,
+    validate_voice_request,
+)
 
 logger = structlog.get_logger()
 
@@ -101,6 +107,8 @@ _TOOL_ICONS: Dict[str, str] = {
     "NotebookEdit": "\U0001f4d3",
     "TodoRead": "\u2611\ufe0f",
     "TodoWrite": "\u2611\ufe0f",
+    "send_voice_to_user": "\U0001f50a",
+    "send_image_to_user": "\U0001f5bc",
 }
 
 
@@ -618,12 +626,16 @@ class MessageOrchestrator:
         cli_detail = ""
         try:
             import subprocess
+
             result = subprocess.run(
                 ["claude", "auth", "status"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode == 0:
                 import json as _json
+
                 cli_status = _json.loads(result.stdout)
                 if cli_status.get("loggedIn"):
                     email = cli_status.get("email", "")
@@ -796,6 +808,7 @@ class MessageOrchestrator:
         mcp_images: Optional[List[ImageAttachment]] = None,
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
+        mcp_voices: Optional[List[VoiceAttachment]] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
@@ -803,17 +816,27 @@ class MessageOrchestrator:
         ``send_image_to_user`` tool calls and collects validated
         :class:`ImageAttachment` objects for later Telegram delivery.
 
+        When *mcp_voices* is provided, the callback intercepts
+        ``send_voice_to_user`` tool calls, synthesizes audio via
+        OpenAI TTS, and collects :class:`VoiceAttachment` objects.
+
         When *draft_streamer* is provided, tool activity and assistant
         text are streamed to the user in real time via
         ``sendMessageDraft``.
 
-        Returns None when verbose_level is 0 **and** no MCP image
+        Returns None when verbose_level is 0 **and** no MCP
         collection or draft streaming is requested.
         Typing indicators are handled by a separate heartbeat task.
         """
         need_mcp_intercept = mcp_images is not None and approved_directory is not None
+        need_tts_intercept = mcp_voices is not None
 
-        if verbose_level == 0 and not need_mcp_intercept and draft_streamer is None:
+        if (
+            verbose_level == 0
+            and not need_mcp_intercept
+            and not need_tts_intercept
+            and draft_streamer is None
+        ):
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
@@ -836,6 +859,42 @@ class MessageOrchestrator:
                         )
                         if img:
                             mcp_images.append(img)
+
+                    # Intercept send_voice_to_user MCP tool calls.
+                    if need_tts_intercept and (
+                        tc_name == "send_voice_to_user"
+                        or tc_name.endswith("__send_voice_to_user")
+                    ):
+                        logger.info(
+                            "TTS tool call intercepted",
+                            tool_name=tc_name,
+                            text_length=len(tc.get("input", {}).get("text", "")),
+                        )
+                        if len(mcp_voices) < MAX_VOICE_MESSAGES_PER_RESPONSE:
+                            tc_input = tc.get("input", {})
+                            validated = validate_voice_request(
+                                tc_input.get("text", ""),
+                                tc_input.get("voice", self.settings.tts_voice),
+                                max_chars=self.settings.tts_max_chars,
+                            )
+                            if validated:
+                                client = self._get_tts_client()
+                                if client:
+                                    logger.info(
+                                        "Synthesizing TTS",
+                                        voice=validated["voice"],
+                                        model=self.settings.tts_model,
+                                        text_preview=validated["text"][:80],
+                                    )
+                                    attachment = await synthesize_voice(
+                                        text=validated["text"],
+                                        voice=validated["voice"],
+                                        openai_client=client,
+                                        model=self.settings.tts_model,
+                                        instructions=tc_input.get("instructions", ""),
+                                    )
+                                    if attachment:
+                                        mcp_voices.append(attachment)
 
             # Capture tool calls
             if update_obj.tool_calls:
@@ -980,6 +1039,49 @@ class MessageOrchestrator:
 
         return caption_sent
 
+    def _get_tts_client(self) -> Any:
+        """Get or create a cached OpenAI async client for TTS."""
+        if hasattr(self, "_tts_openai_client") and self._tts_openai_client is not None:
+            return self._tts_openai_client
+
+        api_key = self.settings.openai_api_key_str
+        if not api_key:
+            logger.warning("TTS requested but OPENAI_API_KEY is not set")
+            return None
+
+        try:
+            from openai import AsyncOpenAI
+        except ModuleNotFoundError:
+            logger.warning("TTS requested but 'openai' package not installed")
+            return None
+
+        self._tts_openai_client = AsyncOpenAI(api_key=api_key)
+        return self._tts_openai_client
+
+    async def _send_voice_messages(
+        self,
+        update: Update,
+        voices: List[VoiceAttachment],
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+    ) -> None:
+        """Send synthesized voice messages via Telegram."""
+        for voice_msg in voices:
+            try:
+                await update.message.reply_voice(
+                    voice=voice_msg.audio_bytes,
+                    reply_to_message_id=reply_to_message_id,
+                    message_thread_id=message_thread_id,
+                )
+                if len(voices) > 1:
+                    await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning(
+                    "Failed to send voice message",
+                    text_preview=voice_msg.text_preview,
+                    error=str(e),
+                )
+
     async def agentic_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1028,6 +1130,7 @@ class MessageOrchestrator:
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
         mcp_images: List[ImageAttachment] = []
+        mcp_voices: List[VoiceAttachment] = []
 
         # Stream drafts (private chats only)
         draft_streamer: Optional[DraftStreamer] = None
@@ -1048,6 +1151,15 @@ class MessageOrchestrator:
             mcp_images=mcp_images,
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
+            mcp_voices=mcp_voices if self.settings.enable_tts else None,
+        )
+
+        # Build TTS system prompt if registry is available
+        extra_system_prompt = self._build_tts_system_prompt(
+            context,
+            chat.id,
+            thread_id=topic_id,
+            reply_to_id=update.message.message_id,
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
@@ -1062,6 +1174,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                extra_system_prompt=extra_system_prompt,
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1193,6 +1306,18 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
 
+        # Send voice messages (from send_voice_to_user tool calls)
+        if mcp_voices:
+            try:
+                await self._send_voice_messages(
+                    update,
+                    mcp_voices,
+                    reply_to_message_id=update.message.message_id,
+                    message_thread_id=topic_id,
+                )
+            except Exception as voice_err:
+                logger.warning("Voice send failed", error=str(voice_err))
+
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
         if audit_logger:
@@ -1291,6 +1416,7 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_doc: List[ImageAttachment] = []
+        mcp_voices_doc: List[VoiceAttachment] = []
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
@@ -1298,6 +1424,14 @@ class MessageOrchestrator:
             time.time(),
             mcp_images=mcp_images_doc,
             approved_directory=self.settings.approved_directory,
+            mcp_voices=mcp_voices_doc if self.settings.enable_tts else None,
+        )
+
+        extra_system_prompt = self._build_tts_system_prompt(
+            context,
+            chat.id,
+            thread_id=topic_id,
+            reply_to_id=update.message.message_id,
         )
 
         heartbeat = self._start_typing_heartbeat(chat, message_thread_id=topic_id)
@@ -1309,6 +1443,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                extra_system_prompt=extra_system_prompt,
             )
 
             if force_new:
@@ -1376,6 +1511,18 @@ class MessageOrchestrator:
                         )
                     except Exception as img_err:
                         logger.warning("Image send failed", error=str(img_err))
+
+            # Send voice messages (from send_voice_to_user tool calls)
+            if mcp_voices_doc:
+                try:
+                    await self._send_voice_messages(
+                        update,
+                        mcp_voices_doc,
+                        reply_to_message_id=update.message.message_id,
+                        message_thread_id=topic_id,
+                    )
+                except Exception as voice_err:
+                    logger.warning("Voice send failed", error=str(voice_err))
 
         except Exception as e:
             from .handlers.message import _format_error_message
@@ -1497,6 +1644,7 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_media: List[ImageAttachment] = []
+        mcp_voices_media: List[VoiceAttachment] = []
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
@@ -1504,6 +1652,14 @@ class MessageOrchestrator:
             time.time(),
             mcp_images=mcp_images_media,
             approved_directory=self.settings.approved_directory,
+            mcp_voices=mcp_voices_media if self.settings.enable_tts else None,
+        )
+
+        extra_system_prompt = self._build_tts_system_prompt(
+            context,
+            chat.id,
+            thread_id=message_thread_id,
+            reply_to_id=update.message.message_id if update.message else None,
         )
 
         heartbeat = self._start_typing_heartbeat(
@@ -1517,6 +1673,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                extra_system_prompt=extra_system_prompt,
             )
         finally:
             heartbeat.cancel()
@@ -1584,6 +1741,50 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+        # Send voice messages (from send_voice_to_user tool calls)
+        if mcp_voices_media:
+            try:
+                await self._send_voice_messages(
+                    update,
+                    mcp_voices_media,
+                    reply_to_message_id=update.message.message_id,
+                    message_thread_id=message_thread_id,
+                )
+            except Exception as voice_err:
+                logger.warning("Voice send failed", error=str(voice_err))
+
+    def _build_tts_system_prompt(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        thread_id: Optional[int] = None,
+        reply_to_id: Optional[int] = None,
+    ) -> Optional[str]:
+        """Build an extra system prompt snippet with a TTS token, if available."""
+        tts_registry = context.bot_data.get("tts_registry")
+        if tts_registry is None:
+            return None
+        token = tts_registry.create_token(
+            bot=context.bot,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            reply_to_id=reply_to_id,
+        )
+        port = self.settings.api_server_port
+        return (
+            f"[TTS]\n"
+            f"To send a voice message to the user, run this curl command via Bash:\n"
+            f"curl -s -X POST http://127.0.0.1:{port}/tts "
+            f'-H "Content-Type: application/json" '
+            f'-d \'{{"token":"{token}","text":"<TEXT>",'
+            f'"voice":"<VOICE>","instructions":"<INSTRUCTIONS>"}}\'\n'
+            f"Available voices: alloy, ash, ballad, coral, echo, fable, nova, "
+            f"onyx, sage, shimmer. Default: {self.settings.tts_voice}. "
+            f"Max text length: {self.settings.tts_max_chars} chars. "
+            f"Max {MAX_VOICE_MESSAGES_PER_RESPONSE} voice messages per response.\n"
+            f"Use the /speak skill when the user asks you to speak or read aloud."
+        )
 
     def _voice_unavailable_message(self) -> str:
         """Return provider-aware guidance when voice feature is unavailable."""
@@ -1723,14 +1924,16 @@ class MessageOrchestrator:
                 auto_name = getattr(ftc, "name", None)
 
         args = update.message.text.split(maxsplit=1)[1:] if update.message.text else []
-        name = args[0].strip() if args else (auto_name or self._default_topic_name(topic_id))
+        name = (
+            args[0].strip()
+            if args
+            else (auto_name or self._default_topic_name(topic_id))
+        )
 
         chat_id = str(chat.id)
         topic_key = str(topic_id)
         bot_config = dict(self.settings.bot_config or {})
-        listen_topics: Dict[str, Dict[str, str]] = bot_config.get(
-            "listen_topics", {}
-        )
+        listen_topics: Dict[str, Dict[str, str]] = bot_config.get("listen_topics", {})
         chat_topics = dict(listen_topics.get(chat_id, {}))
 
         if topic_key in chat_topics:
@@ -1768,9 +1971,7 @@ class MessageOrchestrator:
 
         chat_id = str(chat.id)
         bot_config = dict(self.settings.bot_config or {})
-        listen_topics: Dict[str, Dict[str, str]] = bot_config.get(
-            "listen_topics", {}
-        )
+        listen_topics: Dict[str, Dict[str, str]] = bot_config.get("listen_topics", {})
         chat_topics = dict(listen_topics.get(chat_id, {}))
 
         args = update.message.text.split(maxsplit=1)[1:] if update.message.text else []
@@ -1840,8 +2041,10 @@ class MessageOrchestrator:
             )
             return
 
-        lines = [f"  {escape_html(name)} <code>(#{tid})</code>"
-                 for tid, name in chat_topics.items()]
+        lines = [
+            f"  {escape_html(name)} <code>(#{tid})</code>"
+            for tid, name in chat_topics.items()
+        ]
         await update.message.reply_text(
             "<b>Listening on:</b>\n" + "\n".join(lines),
             parse_mode="HTML",
@@ -1895,9 +2098,7 @@ class MessageOrchestrator:
 
         # Persist to bot_config so it survives restarts
         bot_config = dict(self.settings.bot_config or {})
-        channels: List[Dict[str, Any]] = bot_config.get(
-            "notification_channels", []
-        )
+        channels: List[Dict[str, Any]] = bot_config.get("notification_channels", [])
         entry: Dict[str, Any] = {"chat_id": chat_id, "thread_id": thread_id}
         if entry not in channels:
             channels.append(entry)
@@ -1938,9 +2139,7 @@ class MessageOrchestrator:
 
         # Remove from persisted config
         bot_config = dict(self.settings.bot_config or {})
-        channels: List[Dict[str, Any]] = bot_config.get(
-            "notification_channels", []
-        )
+        channels: List[Dict[str, Any]] = bot_config.get("notification_channels", [])
         entry: Dict[str, Any] = {"chat_id": chat_id, "thread_id": thread_id}
         if entry in channels:
             channels.remove(entry)

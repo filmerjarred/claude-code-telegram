@@ -153,6 +153,7 @@ class ClaudeSDKManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        extra_system_prompt: Optional[str] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -185,6 +186,9 @@ class ClaudeSDKManager:
                     path=str(claude_md_path),
                 )
 
+            if extra_system_prompt:
+                base_prompt += "\n\n" + extra_system_prompt
+
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).
             if self.config.disable_tool_validation:
@@ -214,11 +218,28 @@ class ClaudeSDKManager:
                 stderr=_stderr_callback,
             )
 
+            # Pass skills plugin directory if configured
+            if self.config.skills_plugin_dir:
+                options.plugins = [
+                    {"type": "local", "path": str(self.config.skills_plugin_dir)}
+                ]
+                logger.info(
+                    "Skills plugin directory configured",
+                    plugin_dir=str(self.config.skills_plugin_dir),
+                )
+
             # Pass MCP server configuration if enabled
             if self.config.enable_mcp and self.config.mcp_config_path:
                 options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
                 logger.info(
                     "MCP servers configured",
+                    mcp_config_path=str(self.config.mcp_config_path),
+                    mcp_servers=list(options.mcp_servers.keys()),
+                )
+            else:
+                logger.debug(
+                    "MCP not configured",
+                    enable_mcp=self.config.enable_mcp,
                     mcp_config_path=str(self.config.mcp_config_path),
                 )
 
@@ -523,15 +544,52 @@ class ClaudeSDKManager:
         """Load MCP server configuration from a JSON file.
 
         The new claude-agent-sdk expects mcp_servers as a dict, not a file path.
+
+        For any server entry that does not specify an explicit ``cwd``, this
+        method injects one pointing to the bot's project root (detected by
+        walking up from *config_path* to find ``pyproject.toml``).  Without
+        this, the MCP server subprocess would inherit the **user's** working
+        directory (passed as ``cwd`` in ``ClaudeAgentOptions``), causing
+        relative paths in the MCP config (e.g. ``src/mcp/telegram_server.py``)
+        to fail.
         """
         import json
 
         try:
-            with open(config_path) as f:
+            resolved = config_path.resolve()
+            with open(resolved) as f:
                 config_data = json.load(f)
-            return config_data.get("mcpServers", {})
+            servers = config_data.get("mcpServers", {})
+
+            project_root = self._find_project_root(resolved.parent)
+            for name, server_config in servers.items():
+                if isinstance(server_config, dict) and "cwd" not in server_config:
+                    server_config["cwd"] = str(project_root)
+                    logger.debug(
+                        "Injected cwd for MCP server",
+                        server=name,
+                        cwd=str(project_root),
+                    )
+
+            return servers
         except (json.JSONDecodeError, OSError) as e:
             logger.error(
                 "Failed to load MCP config", path=str(config_path), error=str(e)
             )
             return {}
+
+    @staticmethod
+    def _find_project_root(start: Path) -> Path:
+        """Walk up from *start* to find the nearest ``pyproject.toml``.
+
+        Returns the directory containing it, or *start* as a fallback.
+        """
+        current = start
+        for _ in range(10):
+            if (current / "pyproject.toml").exists():
+                return current
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        return start

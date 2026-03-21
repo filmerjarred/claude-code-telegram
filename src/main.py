@@ -201,6 +201,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "agent_handler": agent_handler,
         "auth_manager": auth_manager,
         "security_validator": security_validator,
+        "rate_limiter": rate_limiter,
     }
 
 
@@ -217,6 +218,7 @@ async def run_application(app: Dict[str, Any]) -> None:
     notification_service: Optional[NotificationService] = None
     scheduler: Optional[JobScheduler] = None
     project_threads_manager: Optional[ProjectThreadManager] = None
+    auth_validator = None
 
     # Set up signal handlers for graceful shutdown
     shutdown_event = asyncio.Event()
@@ -305,12 +307,43 @@ async def run_application(app: Dict[str, Any]) -> None:
         bot_task = asyncio.create_task(bot.start())
         tasks.append(bot_task)
 
+        # TTS context registry (if TTS + API server both enabled)
+        tts_registry = None
+        if features.tts_enabled and features.api_server_enabled:
+            from src.api.tts import TTSContextRegistry
+
+            tts_registry = TTSContextRegistry()
+            bot.deps["tts_registry"] = tts_registry
+            logger.info("TTS HTTP endpoint enabled")
+
         # API server (if enabled)
         if features.api_server_enabled:
             from src.api.server import run_api_server
 
+            # Supabase auth for web interface
+            auth_validator = None
+            if features.web_interface_enabled:
+                from src.api.web_auth import SupabaseAuthValidator
+
+                auth_validator = SupabaseAuthValidator(
+                    supabase_url=config.supabase_url,
+                    supabase_anon_key=config.supabase_anon_key,
+                )
+                logger.info("Web interface enabled with Supabase auth")
+
+            rate_limiter = app.get("rate_limiter")
+
             api_task = asyncio.create_task(
-                run_api_server(event_bus, config, storage.db_manager)
+                run_api_server(
+                    event_bus,
+                    config,
+                    storage.db_manager,
+                    tts_registry=tts_registry,
+                    claude_integration=claude_integration,
+                    auth_validator=auth_validator,
+                    storage=storage,
+                    rate_limiter=rate_limiter,
+                )
             )
             tasks.append(api_task)
             logger.info("API server enabled", port=config.api_server_port)
@@ -365,6 +398,8 @@ async def run_application(app: Dict[str, Any]) -> None:
                 await scheduler.stop()
             if notification_service:
                 await notification_service.stop()
+            if auth_validator:
+                await auth_validator.close()
             await event_bus.stop()
             await bot.stop()
             await claude_integration.shutdown()

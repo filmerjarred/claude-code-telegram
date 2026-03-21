@@ -81,9 +81,33 @@ class FeatureFlags:
         return self.settings.mistral_api_key is not None
 
     @property
+    def tts_enabled(self) -> bool:
+        """Check if text-to-speech voice generation is enabled."""
+        if not self.settings.enable_tts:
+            return False
+        if self.settings.openai_api_key is None:
+            return False
+        try:
+            import openai  # noqa: F401
+
+            return True
+        except ModuleNotFoundError:
+            return False
+
+    @property
     def stream_drafts_enabled(self) -> bool:
         """Check if streaming drafts via sendMessageDraft is enabled."""
         return self.settings.enable_stream_drafts
+
+    @property
+    def web_interface_enabled(self) -> bool:
+        """Check if the web chat interface is enabled."""
+        return (
+            self.settings.enable_web_interface
+            and self.settings.enable_api_server
+            and self.settings.supabase_url is not None
+            and self.settings.supabase_anon_key is not None
+        )
 
     def is_feature_enabled(self, feature_name: str) -> bool:
         """Generic feature check by name."""
@@ -100,7 +124,9 @@ class FeatureFlags:
             "scheduler": self.scheduler_enabled,
             "agentic_mode": self.agentic_mode_enabled,
             "voice_messages": self.voice_messages_enabled,
+            "tts": self.tts_enabled,
             "stream_drafts": self.stream_drafts_enabled,
+            "web_interface": self.web_interface_enabled,
         }
         return feature_map.get(feature_name, False)
 
@@ -129,6 +155,10 @@ class FeatureFlags:
             features.append("scheduler")
         if self.voice_messages_enabled:
             features.append("voice_messages")
+        if self.tts_enabled:
+            features.append("tts")
         if self.stream_drafts_enabled:
             features.append("stream_drafts")
+        if self.web_interface_enabled:
+            features.append("web_interface")
         return features

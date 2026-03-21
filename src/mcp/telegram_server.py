@@ -43,5 +43,51 @@ async def send_image_to_user(file_path: str, caption: str = "") -> str:
     return f"Image queued for delivery: {path.name}"
 
 
+VALID_TTS_VOICES = {
+    "alloy",
+    "ash",
+    "ballad",
+    "coral",
+    "echo",
+    "fable",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+}
+
+
+@mcp.tool()
+async def send_voice_to_user(
+    text: str,
+    voice: str = "nova",
+    instructions: str = "",
+) -> str:
+    """Generate speech from text and send as a voice message to the Telegram user.
+
+    Args:
+        text: The text to convert to speech. Must be non-empty, at most 4096 chars.
+        voice: TTS voice name (alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer).
+        instructions: Optional instructions for speech style/tone.
+
+    Returns:
+        Confirmation string when the voice message is queued for delivery.
+    """
+    if not text or not text.strip():
+        return "Error: text must be non-empty"
+
+    if len(text) > 4096:
+        return f"Error: text too long ({len(text)} chars). Maximum is 4096 characters."
+
+    voice_lower = voice.lower()
+    if voice_lower not in VALID_TTS_VOICES:
+        return (
+            f"Error: unsupported voice '{voice}'. "
+            f"Supported: {', '.join(sorted(VALID_TTS_VOICES))}"
+        )
+
+    return f"Voice message queued for delivery ({len(text)} chars, voice={voice_lower})"
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
